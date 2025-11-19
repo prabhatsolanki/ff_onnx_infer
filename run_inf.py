@@ -1,20 +1,29 @@
 #!/usr/bin/env python3
 """
 Usage:
-  python run_ff.py --onnx models/Run3_2022EE/model.onnx
+  python run_inf.py --onnx models/model_v1911.onnx [--config models/model_v1911.json]
+
+To import FFNetONNXRunner in analysis:
+
+  from run_ff import FFNetONNXRunner
+  runner = FFNetONNXRunner("model.onnx", "model.json")
+  w = runner.compute_w_ff(features)
 """
 
 import argparse
+import json
 import logging
 import os
-from typing import List, Optional
+from pathlib import Path
+from typing import Mapping, Optional, Sequence, Union, List
 
 import numpy as np
 import onnxruntime as ort
 
 LOGGER = logging.getLogger("FF_ONNX")
 
-FEATURE_ORDER: List[str] = [
+# Default ONNX feature order overridden by inout JSON config
+DEFAULT_FEATURE_ORDER: List[str] = [
     "pt",
     "eta",
     "mass",
@@ -33,165 +42,259 @@ FEATURE_ORDER: List[str] = [
     "btagPNetQvG",
 ]
 
-DECAY_MODES_TO_ENCODE: List[int] = [0, 1, 2, 10, 11]
-DECAY_MODE: int = 1
+DEFAULT_CONT_FEATURE_NAMES: List[str] = [
+    "pt",
+    "eta",
+    "mass",
+    "seedingJet_pt",
+    "seedingJet_eta",
+    "seedingJet_mass",
+    "btagPNetB",
+    "btagPNetCvB",
+    "btagPNetCvL",
+    "btagPNetCvNotB",
+    "btagPNetQvG",
+]
 
+ARRAY_WITH_DM_SIZE = len(DEFAULT_CONT_FEATURE_NAMES) + 1
+ARRAY_DM_INDEX = 6  
 
 def setup_logging(verbose: bool) -> None:
     level = logging.DEBUG if verbose else logging.INFO
     logging.basicConfig(
-        level=level,
-        format="%(asctime)s [%(levelname)s] %(message)s",
+        level=level, format="%(asctime)s [%(levelname)s] %(message)s"
     )
 
-
 class FFNetONNXRunner:
-    def __init__(self, model_path: str):
+    def __init__(self, model_path: str, config_path: Optional[str] = None):
         if not os.path.exists(model_path):
             raise FileNotFoundError(f"Could not find ONNX model file: {model_path}")
+
+        self.feature_order = list(DEFAULT_FEATURE_ORDER)
+        self.cont_feature_names = list(DEFAULT_CONT_FEATURE_NAMES)
+        self.decay_mode_indices: List[tuple[int, int]] = []
+        self.feature_index: dict[str, int] = {}
+
+        self._load_config(model_path, config_path)
+        self._init_feature_layout()
 
         LOGGER.info("Loading ONNX model from %s", model_path)
         self.session = ort.InferenceSession(model_path, providers=["CPUExecutionProvider"])
         self.input_name = "raw_input"
         self.output_name = "w_ff"
 
-        LOGGER.info("ONNX session created.")
-        LOGGER.info("Feature order (N=%d):", len(FEATURE_ORDER))
-        for i, name in enumerate(FEATURE_ORDER):
-            LOGGER.info("  [%02d] %s", i, name)
+        LOGGER.info("ONNX session ready (features: %d)", len(self.feature_order))
+        LOGGER.debug("feature_order: %s", self.feature_order)
+        LOGGER.debug("cont_feature_names: %s", self.cont_feature_names)
 
-    def _encode_decay_mode_one_hot(self, decay_mode: int) -> np.ndarray:
-        one_hot = np.zeros(len(DECAY_MODES_TO_ENCODE), dtype=np.float32)
-        matched = False
-        matched_dm = None
-
-        for i, dm in enumerate(DECAY_MODES_TO_ENCODE):
-            if dm == decay_mode:
-                one_hot[i] = 1.0
-                matched = True
-                matched_dm = dm
-            LOGGER.debug(
-                "decayMode one hot: dm=%d -> %s", dm, one_hot[i]
-            )
-
-        if not matched:
-            LOGGER.warning(
-                "DecayMode %d not in %s; all decayMode_* entries will be 0.",
-                decay_mode,
-                DECAY_MODES_TO_ENCODE,
-            )
+    def _load_config(self, model_path: str, config_path: Optional[str]) -> None:
+        if config_path:
+            cfg_path = Path(config_path)
         else:
-            LOGGER.info("Encoded decayMode=%d as one hot.", matched_dm)
+            cfg_path = Path(model_path).with_suffix(".json")
 
-        return one_hot
+        if not cfg_path.exists():
+            LOGGER.info("No config found at %s, using defaults.", cfg_path)
+            return
 
-    def compute_w_ff(self, cont_features: List[float], decay_mode: int) -> float:
-        if len(cont_features) != 11:
+        LOGGER.info("Loading input config from %s", cfg_path)
+        data = json.loads(cfg_path.read_text())
+
+        if not isinstance(data, dict):
+            raise RuntimeError(f"Config file {cfg_path} must contain a JSON object.")
+
+        if "feature_order" in data:
+            self.feature_order = [str(x) for x in data["feature_order"]]
+
+        if "cont_feature_names" in data:
+            self.cont_feature_names = [str(x) for x in data["cont_feature_names"]]
+
+        LOGGER.info(
+            "Config loaded: feature_order=%d, cont_feature_names=%d",
+            len(self.feature_order),
+            len(self.cont_feature_names),
+        )
+
+    def _init_feature_layout(self) -> None:
+        self.feature_index = {name: i for i, name in enumerate(self.feature_order)}
+        self.decay_mode_indices = []
+        for idx, name in enumerate(self.feature_order):
+            if name.startswith("decayMode_"):
+                try:
+                    dm_val = int(name.split("_", 1)[1])
+                    self.decay_mode_indices.append((dm_val, idx))
+                except ValueError:
+                    LOGGER.warning("Could not parse decayMode from '%s'", name)
+
+        if not self.decay_mode_indices:
+            LOGGER.warning("No decayMode_* entries found in feature_order")
+        else:
+            LOGGER.debug("decayMode layout: %s", self.decay_mode_indices)
+        missing = [n for n in self.cont_feature_names if n not in self.feature_index]
+        if missing:
             LOGGER.warning(
-                "cont_features has length %d (expected 11: "
-                "pt,eta,mass,jet_pt,jet_eta,jet_mass,B,CvB,CvL,CvNotB,QvG)",
-                len(cont_features),
+                "Some cont_feature_names not present in feature_order: %s", missing
             )
 
-        cf = np.asarray(cont_features, dtype=np.float32)
-        LOGGER.info(
-            "cont_features (len=%d): %s",
-            len(cf),
-            np.array2string(cf, precision=3, floatmode="fixed"),
-        )
-        LOGGER.info("decayMode = %d", decay_mode)
+    def _from_mapping(
+        self,
+        features: Mapping[str, float],
+        decay_mode: Optional[int],
+    ) -> tuple[np.ndarray, int]:
+        if decay_mode is None:
+            if "decayMode" not in features:
+                raise ValueError(
+                    "Mapping input must contain 'decayMode' if no decay_mode argument is given."
+                )
+            dm = int(features["decayMode"])
+        else:
+            dm = int(decay_mode)
 
-        x = np.zeros((1, len(FEATURE_ORDER)), dtype=np.float32)
+        cf = np.zeros(len(self.cont_feature_names), dtype=np.float32)
+        for i, name in enumerate(self.cont_feature_names):
+            if name in features:
+                cf[i] = float(features[name])
+        return cf, dm
 
-        if len(cf) >= 6:
-            x[0, 0] = cf[0]  # pt
-            x[0, 1] = cf[1]  # eta
-            x[0, 2] = cf[2]  # mass
-            x[0, 3] = cf[3]  # seedingJet_pt
-            x[0, 4] = cf[4]  # seedingJet_eta
-            x[0, 5] = cf[5]  # seedingJet_mass
+    def _from_array(
+        self,
+        arr_like: Union[Sequence[float], np.ndarray],
+        decay_mode: Optional[int],
+    ) -> tuple[np.ndarray, int]:
+        arr = np.asarray(arr_like, dtype=np.float32).ravel()
+        if decay_mode is None:
+            if arr.size != ARRAY_WITH_DM_SIZE:
+                raise ValueError(
+                    f"Array input (without explicit decay_mode) must have length "
+                    f"{ARRAY_WITH_DM_SIZE} (cont + decayMode), got {arr.size}."
+                )
+            dm = int(round(float(arr[ARRAY_DM_INDEX])))
 
-        x[0, 6:11] = self._encode_decay_mode_one_hot(decay_mode)
+            cf = np.zeros(len(self.cont_feature_names), dtype=np.float32)
+            cf[0:6] = arr[0:6]
+            cf[6:] = arr[ARRAY_DM_INDEX + 1 :]
+        else:
+            dm = int(decay_mode)
+            if arr.size != len(self.cont_feature_names):
+                raise ValueError(
+                    f"Array input (with explicit decay_mode) must have length "
+                    f"{len(self.cont_feature_names)}, got {arr.size}."
+                )
+            cf = arr.copy()
 
-        if len(cf) >= 11:
-            x[0, 11] = cf[6]   # btagPNetB
-            x[0, 12] = cf[7]   # btagPNetCvB
-            x[0, 13] = cf[8]   # btagPNetCvL
-            x[0, 14] = cf[9]   # btagPNetCvNotB
-            x[0, 15] = cf[10]  # btagPNetQvG
+        return cf, dm
 
-        LOGGER.info("Input tensor shape: %s, dtype: %s", x.shape, x.dtype)
-        LOGGER.info("Features (name -> value):")
-        for name, val in list(zip(FEATURE_ORDER, x[0])):
-            LOGGER.info("  %-20s = % .6g", name, val)
+    def _build_input_tensor(self, cf: np.ndarray, decay_mode: int) -> np.ndarray:
+        x = np.zeros((1, len(self.feature_order)), dtype=np.float32)
+        for i, name in enumerate(self.cont_feature_names):
+            idx = self.feature_index.get(name)
+            if idx is not None:
+                x[0, idx] = cf[i]
+        if not self.decay_mode_indices:
+            LOGGER.warning("No decayMode_* features in feature_order, decayMode ignored.")
+        else:
+            matched = False
+            for dm_val, idx in self.decay_mode_indices:
+                if idx >= x.shape[1]:
+                    continue
+                x[0, idx] = 1.0 if dm_val == decay_mode else 0.0
+                if dm_val == decay_mode:
+                    matched = True
+            if not matched:
+                LOGGER.warning(
+                    "DecayMode %d not among configured decayMode_* values; one-hot will be all zeros.",
+                    decay_mode,
+                )
 
-        LOGGER.debug("Full input vector: %s", x)
+        LOGGER.debug("Input tensor row: %s", x[0])
+        return x
 
-        LOGGER.info("Running ONNX inference...")
+    def compute_w_ff(
+        self,
+        features: Union[Mapping[str, float], Sequence[float], np.ndarray],
+        decay_mode: Optional[int] = None,
+    ) -> float:
+        if isinstance(features, Mapping):
+            cf, dm = self._from_mapping(features, decay_mode)
+        else:
+            cf, dm = self._from_array(features, decay_mode)
+
+        LOGGER.info("Running inference (decayMode=%d)", dm)
+        x = self._build_input_tensor(cf, dm)
+
         out = self.session.run([self.output_name], {self.input_name: x})[0]
-        LOGGER.info("Raw output shape: %s, dtype: %s", out.shape, out.dtype)
-        LOGGER.debug("Raw output values: %s", out)
-
-        out_flat = np.asarray(out, dtype=np.float32).reshape(-1)
+        out_flat = np.asarray(out, dtype=np.float32).ravel()
         if out_flat.size == 0:
             raise RuntimeError("Model output is empty.")
-        w_ff = float(out_flat[0])
-        LOGGER.info("w_ff = %.6g", w_ff)
-        return w_ff
+        return float(out_flat[0])
 
 
 _runner_instance: Optional[FFNetONNXRunner] = None
 
-
-def initialize_ff_runner(model_path: str) -> None:
+def initialize_ff_runner(model_path: str, config_path: Optional[str] = None) -> None:
     global _runner_instance
-    _runner_instance = FFNetONNXRunner(model_path)
-
+    _runner_instance = FFNetONNXRunner(model_path, config_path)
 
 def get_ff_runner() -> FFNetONNXRunner:
     if _runner_instance is None:
         raise RuntimeError("FFNetONNXRunner has not been initialized.")
     return _runner_instance
 
-
-def build_dummy_cont_features() -> List[float]:
-    cont_features = [
-        45.0,  # pt
-        0.3,   # eta
-        1.2,   # mass
-        50.0,  # seedingJet_pt
-        0.1,   # seedingJet_eta
-        10.0,  # seedingJet_mass
-        0.2,   # btagPNetB
-        0.1,   # btagPNetCvB
-        0.4,   # btagPNetCvL
-        0.3,   # btagPNetCvNotB
-        0.5,   # btagPNetQvG
-    ]
-    LOGGER.info("Dummy cont_features: %s", cont_features)
-    LOGGER.info("Dummy decayMode = %d", DECAY_MODE)
-    return cont_features
-
-
-def main():
+def main() -> None:
     ap = argparse.ArgumentParser("FF ONNX inference")
     ap.add_argument("--onnx", required=True, help="Path to model.onnx")
+    ap.add_argument("--config", help="Optional JSON config with feature_order")
     ap.add_argument("-v", "--verbose", action="store_true", help="Enable DEBUG logs")
     args = ap.parse_args()
 
     setup_logging(args.verbose)
 
-    initialize_ff_runner(args.onnx)
-    runner = get_ff_runner()
+    runner = FFNetONNXRunner(args.onnx, args.config)
 
-    cont_features = build_dummy_cont_features()
-    w_ff = runner.compute_w_ff(cont_features, DECAY_MODE)
+    # Example 1: dict with names
+    features_dict = {
+        "pt": 45.0,
+        "eta": 0.3,
+        "mass": 1.2,
+        "seedingJet_pt": 50.0,
+        "seedingJet_eta": 0.1,
+        "seedingJet_mass": 10.0,
+        "btagPNetB": 0.2,
+        "btagPNetCvB": 0.1,
+        "btagPNetCvL": 0.4,
+        "btagPNetCvNotB": 0.3,
+        "btagPNetQvG": 0.5,
+        "decayMode": 1,
+    }
+    w_dict = runner.compute_w_ff(features_dict)
+
+    # Example 2: plain numpy array 
+    features_arr = np.array(
+        [
+            45.0,  # pt
+            0.3,   # eta
+            1.2,   # mass
+            50.0,  # seedingJet_pt
+            0.1,   # seedingJet_eta
+            10.0,  # seedingJet_mass
+            1.0,   # decayMode 
+            0.2,   # btagPNetB
+            0.1,   # btagPNetCvB
+            0.4,   # btagPNetCvL
+            0.3,   # btagPNetCvNotB
+            0.5,   # btagPNetQvG
+        ],
+        dtype=np.float32,
+    )
+    w_arr = runner.compute_w_ff(features_arr)
 
     print("\n=== SUMMARY ===")
-    print(f"ONNX model:    {args.onnx}")
-    print(f"num features:  {len(FEATURE_ORDER)}")
-    print(f"Decay mode:    {DECAY_MODE}")
-    print(f"w_ff:          {w_ff:.6g}")
+    print(f"ONNX model:   {args.onnx}")
+    if args.config:
+        print(f"Config:       {args.config}")
+    print(f"feature_order length: {len(runner.feature_order)}")
+    print(f"w_ff (dict):  {w_dict:.6g}")
+    print(f"w_ff (array): {w_arr:.6g}")
 
 
 if __name__ == "__main__":

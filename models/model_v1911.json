@@ -1,0 +1,21 @@
+{
+  "feature_order": [
+    "pt",
+    "eta",
+    "mass",
+    "seedingJet_pt",
+    "seedingJet_eta",
+    "seedingJet_mass",
+    "decayMode_0",
+    "decayMode_1",
+    "decayMode_2",
+    "decayMode_10",
+    "decayMode_11",
+    "btagPNetB",
+    "btagPNetCvB",
+    "btagPNetCvL",
+    "btagPNetCvNotB",
+    "btagPNetQvG"
+  ],
+  "model_type": "single"
+}
