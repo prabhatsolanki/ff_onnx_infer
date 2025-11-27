@@ -29,7 +29,8 @@ Each fold has:
         "btagPNetCvNotB",
         "btagPNetQvG"
       ],
-      "model_type": "single"
+      "model_type": "single",
+      "fold": 0
     }
 
 `decayMode_*` entries are constructed internally from the scalar `decayMode`.
@@ -64,14 +65,14 @@ Requirements: `onnxruntime`, `numpy`
 
 Run the example script:
 
-    python run_inf_kfold.py --model-dir models --n-folds 5
+    python run_inf_kfold.py --model-dir models
 
 Use from analysis code:
 
     from run_inf_kfold import KFoldFFONNX
     import numpy as np
 
-    runner = KFoldFFONNX("models", n_folds=5)
+    runner = KFoldFFONNX("models")
 
     w = runner.compute_w_ff(
         event_id       = np.array([...], dtype=np.int64),
@@ -102,14 +103,13 @@ Compile (adjust include/library paths as needed):
 
 Run:
 
-    ./ff_infer models 5
-
-The `main` in `run_inf_kfold.cc` shows how to build:
-
-- `std::vector<long long> event_id`
-- `std::map<std::string, std::vector<float>> features` (keys matching feature names)
+    ./ff_infer models
 
 and call:
 
-    KFoldFFONNX kff("models", 5);
-    auto w = kff.compute_w_ff(event_id, features);
+   KFoldFFONNX kff("models");
+   auto w = kff.compute_w_ff_event(event, decayMode,
+                                    pt, eta, mass,
+                                    seedingJet_pt, seedingJet_eta, seedingJet_mass,
+                                    btagPNetB, btagPNetCvB, btagPNetCvL,
+                                    btagPNetCvNotB, btagPNetQvG);

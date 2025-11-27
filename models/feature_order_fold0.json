@@ -17,5 +17,6 @@
     "btagPNetCvNotB",
     "btagPNetQvG"
   ],
-  "model_type": "single"
+  "model_type": "single",
+  "fold": 0
 }

@@ -3,7 +3,7 @@
 K-fold FF ONNX inference
 
 Usage:
-  python run_inf_kfold.py --model-dir models --n-folds 5
+  python run_inf_kfold.py --model-dir models
 """
 
 import argparse
@@ -24,12 +24,25 @@ def setup_logging(verbose: bool) -> None:
 
 
 class KFoldFFONNXRunner:
-    def __init__(self, model_dir: str, n_folds: int):
-        if n_folds <= 0:
-            raise ValueError("n_folds must be > 0")
-
+    def __init__(self, model_dir: str):
         self.model_dir = Path(model_dir)
-        self.n_folds = n_folds
+
+        folds: List[int] = []
+        for path in self.model_dir.glob("feature_order_fold*.json"):
+            stem = path.stem 
+            if "fold" not in stem:
+                continue
+            try:
+                idx = int(stem.split("fold", 1)[1])
+                folds.append(idx)
+            except ValueError:
+                continue
+
+        if not folds:
+            raise RuntimeError(f"No feature_order_fold*.json found in {self.model_dir}")
+
+        self.n_folds = max(folds) + 1
+        LOG.info("Initialising K-fold runner from %s (n_folds=%d)", self.model_dir, self.n_folds)
 
         self.sessions: List[ort.InferenceSession] = []
         self.fold_feature_order: List[List[str]] = []
@@ -37,9 +50,7 @@ class KFoldFFONNXRunner:
         self.fold_dm_values: List[List[int]] = []
         self.fold_dm_indices: List[List[int]] = []
 
-        LOG.info("Initialising K-fold runner from %s (n_folds=%d)", self.model_dir, n_folds)
-
-        for fold in range(n_folds):
+        for fold in range(self.n_folds):
             onnx_path = self.model_dir / f"model_fold{fold}.onnx"
             json_path = self.model_dir / f"feature_order_fold{fold}.json"
 
@@ -47,9 +58,6 @@ class KFoldFFONNXRunner:
                 raise FileNotFoundError(f"Missing ONNX model: {onnx_path}")
             if not json_path.exists():
                 raise FileNotFoundError(f"Missing feature-order JSON: {json_path}")
-
-            LOG.debug("Fold %d: ONNX model: %s", fold, onnx_path)
-            LOG.debug("Fold %d: feature config: %s", fold, json_path)
 
             data = json.loads(json_path.read_text())
             feature_order = list(data["feature_order"])
@@ -70,12 +78,13 @@ class KFoldFFONNXRunner:
             sess = ort.InferenceSession(str(onnx_path), providers=["CPUExecutionProvider"])
             self.sessions.append(sess)
 
+            LOG.info("Fold %d: ONNX initialised from %s", fold, onnx_path)
+
         base_order = self.fold_feature_order[0]
         self.scalar_feature_names = [n for n in base_order if not n.startswith("decayMode_")]
         self.decay_feature_names = [n for n in base_order if n.startswith("decayMode_")]
 
-
-        LOG.info("Example feature_order (fold 0): %s", ", ".join(base_order))
+        LOG.info("Feature order (fold 0): %s", ", ".join(base_order))
 
     def compute_w_ff(self, event_id: np.ndarray, **feat_arrays: np.ndarray) -> np.ndarray:
         event_id = np.asarray(event_id, dtype=np.int64).ravel()
@@ -90,10 +99,10 @@ class KFoldFFONNXRunner:
         if decay_mode.size != n:
             raise ValueError("decayMode length mismatch with event_id")
 
-        LOG.debug("User provided feature arrays: %s", ", ".join(sorted(feat_arrays.keys())))
-        LOG.debug("Number of events: %d", n)
-        LOG.debug("Using scalar feature names: %s", ", ".join(self.scalar_feature_names))
-        LOG.debug("Using 'decayMode' -> one-hot encoded into: %s", ", ".join(self.decay_feature_names))
+        LOG.info("compute_w_ff: n_taus=%d", n)
+        LOG.debug("User features: %s", ", ".join(sorted(feat_arrays.keys())))
+        LOG.debug("Scalar features: %s", ", ".join(self.scalar_feature_names))
+        LOG.debug("Decay one-hot features: %s", ", ".join(self.decay_feature_names))
 
         scalar_arrays: Dict[str, np.ndarray] = {}
         for name in self.scalar_feature_names:
@@ -132,8 +141,6 @@ class KFoldFFONNXRunner:
             for dv, col in zip(dm_vals, dm_idx):
                 x[:, col] = (dm_slice == dv).astype(np.float32)
 
-            LOG.debug("Fold %d: %d events, feature_order: %s", fold, m, fo)
-
             sess = self.sessions[fold]
             y = sess.run(["w_ff"], {"raw_input": x})[0].reshape(-1).astype(np.float32)
             w[idxs] = y
@@ -143,18 +150,21 @@ class KFoldFFONNXRunner:
 
 def main() -> None:
     ap = argparse.ArgumentParser("K-fold FF ONNX inference")
-    ap.add_argument("--model-dir", required=True, help="Directory with model_fold*.onnx and feature_order_fold*.json")
-    ap.add_argument("--n-folds", type=int, required=False, default=5, help="Number of folds")
+    ap.add_argument(
+        "--model-dir",
+        required=True,
+        help="Directory with model_fold*.onnx and feature_order_fold*.json",
+    )
     ap.add_argument("-v", "--verbose", action="store_true", help="Verbose logging")
     args = ap.parse_args()
 
     setup_logging(args.verbose)
 
-    runner = KFoldFFONNXRunner(args.model_dir, args.n_folds)
+    runner = KFoldFFONNXRunner(args.model_dir)
 
     # example
     n = 8
-    event_id   = np.array([1001,1001,1002,1003,1004,1005,1005,1006], dtype=np.int64)
+    event_id   = np.array([1001, 1001, 1002, 1003, 1004, 1005, 1005, 1006], dtype=np.int64)
     decay_mode = np.array([0, 1, 2, 10, 11, 0, 1, 2], dtype=np.int32)
 
     def fill(v: float) -> np.ndarray:
@@ -190,7 +200,8 @@ def main() -> None:
 
     print("event_id  fold  decayMode  w_ff")
     for i in range(n):
-        print(f"{int(event_id[i]):7d}  {int(event_id[i] % args.n_folds):4d}  {int(decay_mode[i]):9d}  {w[i]:.6g}")
+        fold = int(event_id[i] % runner.n_folds)
+        print(f"{int(event_id[i]):7d}  {fold:4d}  {int(decay_mode[i]):9d}  {w[i]:.6g}")
 
 
 if __name__ == "__main__":

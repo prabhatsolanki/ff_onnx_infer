@@ -6,22 +6,33 @@
 //       -L/cvmfs/sft.cern.ch/lcg/views/LCG_107/x86_64-el9-gcc11-opt/lib64 \
 //       -lonnxruntime -std=c++17 -O2
 //
-//   ./ff_infer models 5
+//   ./ff_infer models
+//
+// In analysis (RDataFrame), call:
+//
+//   KFoldFFONNX kff("models");
+//   auto w = kff.compute_w_ff_event(event, decayMode,
+//                                   pt, eta, mass,
+//                                   seedingJet_pt, seedingJet_eta, seedingJet_mass,
+//                                   btagPNetB, btagPNetCvB, btagPNetCvL,
+//                                   btagPNetCvNotB, btagPNetQvG);
 
 #include "onnxruntime_cxx_api.h"
 #include <nlohmann/json.hpp>
 
+#include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <filesystem>
 #include <fstream>
 #include <iostream>
-#include <map>
 #include <memory>
 #include <stdexcept>
 #include <string>
 #include <vector>
 
 using json = nlohmann::json;
+namespace fs = std::filesystem;
 
 struct FoldConfig {
     std::vector<std::string> feature_order;
@@ -46,20 +57,46 @@ struct FoldConfig {
 
 class KFoldFFONNX {
 public:
-    KFoldFFONNX(const std::string& model_dir, int n_folds)
-        : env_(ORT_LOGGING_LEVEL_WARNING, "FF_KFold"),
-          n_folds_(n_folds)
+    explicit KFoldFFONNX(const std::string& model_dir)
+        : env_(ORT_LOGGING_LEVEL_WARNING, "FF_KFold")
     {
-        if (n_folds_ <= 0) {
-            throw std::runtime_error("n_folds must be > 0");
+        // folds from feature_order_fold*.json 
+        std::vector<int> fold_ids;
+        for (const auto& entry : fs::directory_iterator(model_dir)) {
+            if (!entry.is_regular_file()) continue;
+            auto name = entry.path().filename().string(); 
+            const std::string prefix = "feature_order_fold";
+            const std::string suffix = ".json";
+            if (name.rfind(prefix, 0) == 0 &&
+                name.size() > prefix.size() + suffix.size() &&
+                name.substr(name.size() - suffix.size()) == suffix)
+            {
+                std::string num = name.substr(
+                    prefix.size(),
+                    name.size() - prefix.size() - suffix.size()
+                );
+                try {
+                    int idx = std::stoi(num);
+                    fold_ids.push_back(idx);
+                    std::cout << "[info] Found fold ID " << idx << " from " << name << "\n";
+                } catch (...) {
+                }
+            }
         }
 
+        if (fold_ids.empty()) {
+            throw std::runtime_error("No feature_order_fold*.json found in " + model_dir);
+        }
+
+        int max_fold = *std::max_element(fold_ids.begin(), fold_ids.end());
+        n_folds_ = max_fold + 1;
+
         std::cout << "[info] Initialising KFoldFFONNX from " << model_dir
-                  << " with n_folds=" << n_folds_ << "\n";
+                  << " (n_folds=" << n_folds_ << ")\n";
 
         for (int f = 0; f < n_folds_; ++f) {
-            std::string onnx_path = model_dir + "/model_fold" + std::to_string(f) + ".onnx";
             std::string cfg_path  = model_dir + "/feature_order_fold" + std::to_string(f) + ".json";
+            std::string onnx_path = model_dir + "/model_fold"        + std::to_string(f) + ".onnx";
 
             std::ifstream cf(cfg_path);
             if (!cf) {
@@ -88,12 +125,6 @@ public:
         }
 
         const auto& fo0 = fold_cfgs_.front().feature_order;
-        for (const auto& name : fo0) {
-            if (name.rfind("decayMode_", 0) != 0) {
-                scalar_features_.push_back(name);
-            }
-        }
-
         std::cout << "[info] Feature order (fold 0): ";
         for (std::size_t i = 0; i < fo0.size(); ++i) {
             std::cout << fo0[i];
@@ -102,166 +133,134 @@ public:
         std::cout << "\n";
     }
 
-    std::vector<float> compute_w_ff(
-        const std::vector<long long>& event_id,
-        const std::map<std::string, std::vector<float>>& features)
+    int n_folds() const { return n_folds_; }
+
+    float compute_w_ff_event(
+        long long event_id,
+        int decayMode,
+        float pt,
+        float eta,
+        float mass,
+        float seedingJet_pt,
+        float seedingJet_eta,
+        float seedingJet_mass,
+        float btagPNetB,
+        float btagPNetCvB,
+        float btagPNetCvL,
+        float btagPNetCvNotB,
+        float btagPNetQvG)
     {
-        std::size_t n = event_id.size();
-        if (n == 0) {
-            return {};
+        int fold = static_cast<int>(event_id % n_folds_);
+        if (fold < 0) fold += n_folds_;
+
+        const auto& cfg = fold_cfgs_[fold];
+        auto& sess      = *sessions_[fold];
+
+        std::size_t n_feat = cfg.feature_order.size();
+        std::vector<float> input_data(n_feat, 0.f);
+
+        const char* names[] = {
+            "pt",
+            "eta",
+            "mass",
+            "seedingJet_pt",
+            "seedingJet_eta",
+            "seedingJet_mass",
+            "btagPNetB",
+            "btagPNetCvB",
+            "btagPNetCvL",
+            "btagPNetCvNotB",
+            "btagPNetQvG"
+        };
+        float vals[] = {
+            pt,
+            eta,
+            mass,
+            seedingJet_pt,
+            seedingJet_eta,
+            seedingJet_mass,
+            btagPNetB,
+            btagPNetCvB,
+            btagPNetCvL,
+            btagPNetCvNotB,
+            btagPNetQvG
+        };
+        constexpr std::size_t n_scalar = sizeof(vals) / sizeof(vals[0]);
+
+        for (std::size_t i = 0; i < n_scalar; ++i) {
+            auto it = cfg.feature_index.find(names[i]);
+            if (it == cfg.feature_index.end()) continue;
+            input_data[it->second] = vals[i];
         }
 
-        std::cout << "[info] compute_w_ff: n_events=" << n << "\n";
-
-        auto dm_it = features.find("decayMode");
-        if (dm_it == features.end()) {
-            throw std::runtime_error("Missing feature 'decayMode'.");
-        }
-        if (dm_it->second.size() != n) {
-            throw std::runtime_error("decayMode feature size mismatch.");
+        // decayMode one hot 
+        for (std::size_t i = 0; i < cfg.decay_modes.size(); ++i) {
+            int dm_val        = cfg.decay_modes[i];
+            std::size_t col_j = cfg.decay_indices[i];
+            input_data[col_j] = (decayMode == dm_val) ? 1.f : 0.f;
         }
 
-        std::vector<int> decay_mode(n);
-        for (std::size_t i = 0; i < n; ++i) {
-            decay_mode[i] = static_cast<int>(std::lround(dm_it->second[i]));
-        }
+        Ort::MemoryInfo mem_info = Ort::MemoryInfo::CreateCpu(
+            OrtArenaAllocator, OrtMemTypeDefault);
+        std::vector<int64_t> shape{1, static_cast<int64_t>(n_feat)};
 
-        for (const auto& name : scalar_features_) {
-            auto it = features.find(name);
-            if (it == features.end()) {
-                throw std::runtime_error("Missing scalar feature: " + name);
-            }
-            if (it->second.size() != n) {
-                throw std::runtime_error("Size mismatch for feature: " + name);
-            }
-        }
+        Ort::Value input_tensor = Ort::Value::CreateTensor<float>(
+            mem_info,
+            input_data.data(),
+            input_data.size(),
+            shape.data(),
+            shape.size()
+        );
 
-        std::vector<float> out(n, 0.f);
+        const char* input_names[]  = {"raw_input"};
+        const char* output_names[] = {"w_ff"};
 
-        for (int f = 0; f < n_folds_; ++f) {
-            std::vector<std::size_t> idxs;
-            idxs.reserve(n);
-            for (std::size_t i = 0; i < n; ++i) {
-                if (static_cast<int>(event_id[i] % n_folds_) == f) {
-                    idxs.push_back(i);
-                }
-            }
-            if (idxs.empty()) continue;
+        auto output_tensors = sess.Run(
+            Ort::RunOptions{nullptr},
+            input_names, &input_tensor, 1,
+            output_names, 1
+        );
 
-            const auto& cfg  = fold_cfgs_[f];
-            auto& sess       = *sessions_[f];
-
-            std::size_t m      = idxs.size();
-            std::size_t n_feat = cfg.feature_order.size();
-            std::vector<float> input_data(m * n_feat, 0.f);
-
-            for (const auto& name : scalar_features_) {
-                const auto& col = features.at(name);
-                auto fi_it = cfg.feature_index.find(name);
-                if (fi_it == cfg.feature_index.end()) continue;
-                std::size_t j = fi_it->second;
-                for (std::size_t k = 0; k < m; ++k) {
-                    std::size_t i = idxs[k];
-                    input_data[k * n_feat + j] = col[i];
-                }
-            }
-
-            // decayMode one-hot
-            for (std::size_t dm_i = 0; dm_i < cfg.decay_modes.size(); ++dm_i) {
-                int dm_val        = cfg.decay_modes[dm_i];
-                std::size_t col_j = cfg.decay_indices[dm_i];
-                for (std::size_t k = 0; k < m; ++k) {
-                    std::size_t i = idxs[k];
-                    input_data[k * n_feat + col_j] =
-                        (decay_mode[i] == dm_val) ? 1.f : 0.f;
-                }
-            }
-
-            Ort::MemoryInfo mem_info = Ort::MemoryInfo::CreateCpu(
-                OrtArenaAllocator, OrtMemTypeDefault);
-            std::vector<int64_t> shape{
-                static_cast<int64_t>(m),
-                static_cast<int64_t>(n_feat)
-            };
-
-            Ort::Value input_tensor = Ort::Value::CreateTensor<float>(
-                mem_info,
-                input_data.data(),
-                input_data.size(),
-                shape.data(),
-                shape.size()
-            );
-
-            const char* input_names[]  = {"raw_input"};
-            const char* output_names[] = {"w_ff"};
-
-            auto output_tensors = sess.Run(
-                Ort::RunOptions{nullptr},
-                input_names, &input_tensor, 1,
-                output_names, 1
-            );
-
-            float* out_data = output_tensors[0].GetTensorMutableData<float>();
-            for (std::size_t k = 0; k < m; ++k) {
-                out[idxs[k]] = out_data[k];
-            }
-        }
-
-        return out;
+        float* out_data = output_tensors[0].GetTensorMutableData<float>();
+        return out_data[0];
     }
 
 private:
     Ort::Env env_;
-    int n_folds_;
+    int n_folds_{0};
     std::vector<std::unique_ptr<Ort::Session>> sessions_;
     std::vector<FoldConfig> fold_cfgs_;
-    std::vector<std::string> scalar_features_;
 };
 
 int main(int argc, char* argv[]) {
-    if (argc < 3) {
-        std::cerr << "Usage: " << argv[0] << " MODEL_DIR N_FOLDS\n";
+    if (argc < 2) {
+        std::cerr << "Usage: " << argv[0] << " MODEL_DIR\n";
         return 1;
     }
 
     std::string model_dir = argv[1];
-    int n_folds = std::stoi(argv[2]);
 
     try {
-        KFoldFFONNX kff(model_dir, n_folds);
+        KFoldFFONNX kff(model_dir);
 
         // example
-        std::size_t n = 8;
-        std::vector<long long> event_id{1000, 1000, 1002, 1003, 1004, 1005, 1006, 1006};
-
-        auto fill = [n](float v) {
-            return std::vector<float>(n, v);
-        };
-
-        std::map<std::string, std::vector<float>> feats;
-        feats["decayMode"]      = {0.f, 1.f, 2.f, 10.f, 11.f, 0.f, 1.f, 2.f};
-        feats["pt"]             = fill(45.0f);
-        feats["eta"]            = fill(0.3f);
-        feats["mass"]           = fill(1.2f);
-        feats["seedingJet_pt"]  = fill(50.0f);
-        feats["seedingJet_eta"] = fill(0.1f);
-        feats["seedingJet_mass"]= fill(10.0f);
-        feats["btagPNetB"]      = fill(0.2f);
-        feats["btagPNetCvB"]    = fill(0.1f);
-        feats["btagPNetCvL"]    = fill(0.4f);
-        feats["btagPNetCvNotB"] = fill(0.3f);
-        feats["btagPNetQvG"]    = fill(0.5f);
-
-        auto w = kff.compute_w_ff(event_id, feats);
+        std::vector<long long> event_id = {1000, 1001, 1002, 1003, 1004};
+        std::vector<int>       decay    = {0,    1,    2,    10,   11};
 
         std::cout << "event_id  fold  decayMode  w_ff\n";
-        for (std::size_t i = 0; i < n; ++i) {
-            int fold = static_cast<int>(event_id[i] % n_folds);
-            int dm   = static_cast<int>(std::lround(feats["decayMode"][i]));
+        for (std::size_t i = 0; i < event_id.size(); ++i) {
+            float w = kff.compute_w_ff_event(
+                event_id[i],
+                decay[i],
+                45.f, 0.3f, 1.2f,
+                50.f, 0.1f, 10.f,
+                0.2f, 0.1f, 0.4f, 0.3f, 0.5f
+            );
+            int fold = static_cast<int>(event_id[i] % kff.n_folds());
             std::cout << event_id[i] << "  "
                       << fold << "  "
-                      << dm << "  "
-                      << w[i] << "\n";
+                      << decay[i] << "  "
+                      << w << "\n";
         }
 
         return 0;
