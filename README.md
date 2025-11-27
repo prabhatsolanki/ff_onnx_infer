@@ -107,8 +107,8 @@ Run:
 
 and call:
 
-   KFoldFFONNX kff("models");
-   auto w = kff.compute_w_ff_event(event, decayMode,
+     KFoldFFONNX kff("models");
+     auto w = kff.compute_w_ff_event(event, decayMode,
                                     pt, eta, mass,
                                     seedingJet_pt, seedingJet_eta, seedingJet_mass,
                                     btagPNetB, btagPNetCvB, btagPNetCvL,
