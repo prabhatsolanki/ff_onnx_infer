@@ -1,46 +1,115 @@
-# FF ONNX Inference (Python & C++)
+# FF ONNX K-Fold Inference
 
-Helpers to run the fake factor (FF) ONNX model from both Python and C++ with the same conventions.
+Helpers to run a k-fold fake-factor (FF) ONNX setup from both Python and C++.
 
-## Model
+## Model layout
 
-The ONNX model is expected to:
+Each fold has:
 
-- Take a single input tensor named: `raw_input`
-- Produce a single output tensor named: `w_ff`
+- `model_fold{N}.onnx` – ONNX model with:
+  - input tensor name: `raw_input`
+  - output tensor name: `w_ff`
+- `feature_order_fold{N}.json` – JSON with:
+    {
+      "feature_order": [
+        "pt",
+        "eta",
+        "mass",
+        "seedingJet_pt",
+        "seedingJet_eta",
+        "seedingJet_mass",
+        "decayMode_0",
+        "decayMode_1",
+        "decayMode_2",
+        "decayMode_10",
+        "decayMode_11",
+        "btagPNetB",
+        "btagPNetCvB",
+        "btagPNetCvL",
+        "btagPNetCvNotB",
+        "btagPNetQvG"
+      ],
+      "model_type": "single"
+    }
+
+`decayMode_*` entries are constructed internally from the scalar `decayMode`.
 
 ## Inputs
 
-- Expect a 16-dimensional feature vector (dict or 1D NumPy array):
+Per-event inputs (Python: NumPy arrays, C++: `std::vector<float>` / `std::vector<long long>`):
 
-  `cont_features = [pt, eta, mass, seedingJet_pt, seedingJet_eta, seedingJet_mass, btagPNetB, btagPNetCvB, btagPNetCvL, btagPNetCvNotB, btagPNetQvG]`
-  `decayMode` = scalar integer (e.g. 0, 1, 2, 10, 11)
+- `event_id` (integer, used as `event_id % n_folds` to select the fold)
+- `decayMode` (integer: e.g. 0, 1, 2, 10, 11)
+- `pt`, `eta`, `mass`
+- `seedingJet_pt`, `seedingJet_eta`, `seedingJet_mass`
+- `btagPNetB`, `btagPNetCvB`, `btagPNetCvL`, `btagPNetCvNotB`, `btagPNetQvG`
 
-The code internally converts `decayMode` into one-hot `decayMode_*` entries.
+Feature names must match those in `feature_order_fold{N}.json`, but user-side ordering does not matter. The code:
+
+- reads the JSON feature order for each fold,
+- builds the ONNX input in that order,
+- converts `decayMode` to one-hot `decayMode_*` internally.
 
 ## Files
 
-- `run_inf.py` – Python ONNX Runtime wrapper with a small runner class and a dummy test.
-- `run_inf.cc` – C++ ONNX Runtime wrapper (namespace `ff_interface`) plus a small test `main`.
-- `models/` – exported FF model and feature order.
+- `run_inf_kfold.py` – Python ONNX Runtime wrapper (`KFoldFFONNX`) with a small example `main`.
+- `run_inf_kfold.cc` – C++ ONNX Runtime wrapper (`KFoldFFONNX`) plus a small example `main`.
+- `models/` – directory with `model_fold*.onnx` and `feature_order_fold*.json`.
 
 ## Usage
 
-**Python**
+### Python
 
-- Install: `onnxruntime`, `numpy`
-- Example:  
-  `python run_inf.py --onnx path/to/model.onnx [--config path/to/model.json]`
+Requirements: `onnxruntime`, `numpy`
 
-- To import FFNetONNXRunner in analysis:
+Run the example script:
 
-   `from run_ff import FFNetONNXRunner`
-   `runner = FFNetONNXRunner("model.onnx", "model.json")`
-   `w = runner.compute_w_ff(features)`
+    python run_inf_kfold.py --model-dir models --n-folds 5
 
-**C++**
+Use from analysis code:
 
-- Compile `run_inf.cc` against ONNX Runtime
-  `g++ run_inf.cc -o ff_infer   -I/cvmfs/sft.cern.ch/lcg/views/LCG_107/x86_64-el9-gcc11-opt/include/onnxruntime  -L/cvmfs/sft.cern.ch/lcg/views/LCG_107/x86_64-el9-gcc11-opt/lib64 -lonnxruntime`
-- Example:  
-  `./ff_infer path/to/model.onnx path/to/model.json` 
+    from run_inf_kfold import KFoldFFONNX
+    import numpy as np
+
+    runner = KFoldFFONNX("models", n_folds=5)
+
+    w = runner.compute_w_ff(
+        event_id       = np.array([...], dtype=np.int64),
+        decayMode      = np.array([...], dtype=np.int32),
+        pt             = np.array([...], dtype=np.float32),
+        eta            = np.array([...], dtype=np.float32),
+        mass           = np.array([...], dtype=np.float32),
+        seedingJet_pt  = np.array([...], dtype=np.float32),
+        seedingJet_eta = np.array([...], dtype=np.float32),
+        seedingJet_mass= np.array([...], dtype=np.float32),
+        btagPNetB      = np.array([...], dtype=np.float32),
+        btagPNetCvB    = np.array([...], dtype=np.float32),
+        btagPNetCvL    = np.array([...], dtype=np.float32),
+        btagPNetCvNotB = np.array([...], dtype=np.float32),
+        btagPNetQvG    = np.array([...], dtype=np.float32),
+    )
+
+`w` is a 1D NumPy array of `w_ff` values, one per tau.
+
+### C++
+
+Compile (adjust include/library paths as needed):
+
+    g++ run_inf_kfold.cc -o ff_infer \
+        -I/cvmfs/sft.cern.ch/lcg/views/LCG_107/x86_64-el9-gcc11-opt/include/onnxruntime \
+        -L/cvmfs/sft.cern.ch/lcg/views/LCG_107/x86_64-el9-gcc11-opt/lib64 \
+        -lonnxruntime -std=c++17 -O2
+
+Run:
+
+    ./ff_infer models 5
+
+The `main` in `run_inf_kfold.cc` shows how to build:
+
+- `std::vector<long long> event_id`
+- `std::map<std::string, std::vector<float>> features` (keys matching feature names)
+
+and call:
+
+    KFoldFFONNX kff("models", 5);
+    auto w = kff.compute_w_ff(event_id, features);
